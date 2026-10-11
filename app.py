@@ -143,7 +143,7 @@ def press(token: str):
 # ---------------------------------------------------------------
 # 4. User interface
 # ---------------------------------------------------------------
-st.title("🧮 Scientific Calculator")
+st.title("Abdul Wahab's Calculator")
 
 st.radio("Angle mode", ["Degrees", "Radians"], horizontal=True, key="angle")
 
