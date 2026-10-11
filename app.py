@@ -4,7 +4,7 @@ import re
 
 import streamlit as st
 
-st.set_page_config(page_title="Abdul Wahab", layout="centered")
+st.set_page_config(page_title="Abdul Wahab's Calculator", layout="centered")
 
 # ---------------------------------------------------------------
 # 1. Session state (Streamlit reruns the script on every click,
