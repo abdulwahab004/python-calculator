@@ -1,11 +1,16 @@
 import ast
 import html
+import json
 import math
 import re
 
 import streamlit as st
+import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Abdul Wahab's", page_icon="🧮", layout="centered")
+st.set_page_config(
+    page_title="Abdul Wahab's Calculator", page_icon="🧮", layout="centered",
+    initial_sidebar_state="expanded",
+)
 
 # ---------------------------------------------------------------
 # 1. STYLE  (all the look-and-feel lives here)
@@ -35,6 +40,9 @@ BASE_CSS = """
     max-width: 440px; padding-top: 2.2rem; padding-bottom: 2rem;
 }
 
+/* hidden holder for the keyboard script */
+.st-key-kbd { position: absolute; width: 0; height: 0; overflow: hidden; margin: 0; padding: 0; }
+
 /* calculator body */
 .st-key-calc {
     background: var(--panel); border-radius: 32px; padding: 20px; gap: .55rem;
@@ -53,8 +61,10 @@ BASE_CSS = """
     background: var(--screen); border-radius: 22px; padding: 14px 18px 10px; gap: .1rem;
     box-shadow: inset 0 2px 8px rgba(44,60,100,.12);
 }
-.prev { text-align: right; color: var(--muted); font-size: .85rem; min-height: 1.3rem;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prev { display: flex; justify-content: space-between; gap: .6rem; color: var(--muted);
+        font-size: .85rem; min-height: 1.3rem; }
+.prev span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mem { font-weight: 800; color: #4A49CB; }
 .err { text-align: right; color: #C0453D; font-size: .8rem; font-weight: 600; min-height: 1.1rem; }
 .st-key-screen [data-baseweb="input"], .st-key-screen [data-baseweb="base-input"] {
     background: transparent !important; border: none !important; box-shadow: none !important;
@@ -63,15 +73,25 @@ BASE_CSS = """
     background: transparent !important; color: var(--ink) !important; text-align: right;
     font-size: 2.1rem; font-weight: 700; height: 3rem; padding: 0 !important;
     letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+    caret-color: transparent; cursor: default;
 }
 .st-key-screen input::placeholder { color: #B4BDCD; }
 .st-key-screen [data-testid="InputInstructions"] { display: none; }
 
-/* history */
-[data-testid="stExpander"] { background: rgba(255,255,255,.55); border: none; border-radius: 20px; margin-top: 1rem; }
-[data-testid="stExpander"] summary p { color: var(--ink); font-weight: 600; }
+/* history entries */
 .hist { color: #3E4A66; font-size: .92rem; padding: .25rem 0; border-bottom: 1px solid rgba(44,60,100,.08); }
 .hist-empty { color: var(--muted); font-size: .9rem; }
+
+/* left panel (history + keyboard shortcuts) */
+[data-testid="stSidebar"] { background: #F3F6FB; border-right: 1px solid rgba(44,60,100,.08); }
+.side-title { font-weight: 700; font-size: 1.05rem; color: var(--ink); margin: .2rem 0 .4rem; }
+[data-testid="stSidebar"] table { font-size: .82rem; }
+[data-testid="stSidebar"] th, [data-testid="stSidebar"] td { color: #3E4A66; padding: .35rem .5rem; }
+[data-testid="stSidebar"] code { background: #E3E9F4; color: #3E4A66; border-radius: 6px; padding: .1rem .35rem; font-size: .78rem; }
+.side-note { color: var(--muted); font-size: .8rem; line-height: 1.5; }
+
+/* a key flashes when you press it on the keyboard */
+.st-key-calc button.kbd-press { transform: scale(.93) !important; filter: brightness(.9) !important; }
 
 @media (max-width: 480px) {
     .st-key-calc { padding: 14px; border-radius: 26px; }
@@ -116,7 +136,14 @@ st.markdown(f"<style>{BASE_CSS}{build_key_css()}</style>", unsafe_allow_html=Tru
 # ---------------------------------------------------------------
 # 2. SESSION STATE (Streamlit reruns the script on every click)
 # ---------------------------------------------------------------
-defaults = {"expr": "", "ans": 0, "history": [], "error": ""}
+defaults = {
+    "expr": "",       # what is on the display
+    "ans": 0,         # last answer (Ans key)
+    "memory": 0,      # memory (M+ M- MR MC)
+    "history": [],    # past calculations
+    "error": "",      # error message under the display
+    "fresh": False,   # True right after "=": typing a number starts a new calculation
+}
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
@@ -186,7 +213,11 @@ def prepare(expression: str) -> str:
     """Turn what the user sees into valid Python."""
     e = expression.replace("^", "**").replace("×", "*").replace("÷", "/")
     e = e.replace("π", "pi").replace("√", "sqrt").replace("−", "-")
-    e = re.sub(r"(\d+)!", r"factorial(\1)", e)  # 5!  ->  factorial(5)
+    # 5!  or  (2+3)!   ->  factorial(5)
+    e = re.sub(r"(\d+(?:\.\d+)?|\([^()]*\))!", r"factorial(\1)", e)
+    # implicit multiplication: 2pi, 3(4+5), 2sin(30), (1+2)(3+4)
+    e = re.sub(r"(\d|\))\s*(?=[a-zA-Z(])", r"\1*", e)
+    e = re.sub(r"\b(pi|ans|e)\b\s*(?=[\d(a-zA-Z])", r"\1*", e)
     return e
 
 
@@ -201,95 +232,107 @@ def fmt(value) -> str:
     return f"{value:.10g}"
 
 
+def close_brackets(expr: str) -> str:
+    """Add any missing ")" so that sin(30 works like sin(30)."""
+    return expr + ")" * max(0, expr.count("(") - expr.count(")"))
+
+
+def is_degrees() -> bool:
+    return st.session_state.get("angle") != "RAD"
+
+
 # ---------------------------------------------------------------
-# 4. CALLBACKS
+# 4. CALLBACKS (run when a key is pressed)
 # ---------------------------------------------------------------
 def calculate():
-    expr = st.session_state.expr.strip()
-    st.session_state.error = ""
+    s = st.session_state
+    expr = s.expr.strip()
+    s.error = ""
     if not expr:
         return
-    degrees = st.session_state.get("angle") != "RAD"
+    expr = close_brackets(expr)
     try:
-        value = safe_eval(prepare(expr), build_namespace(degrees))
+        value = safe_eval(prepare(expr), build_namespace(is_degrees()))
         text = fmt(value)
-        st.session_state.history.append(f"{expr} = {text}")
-        st.session_state.ans = value
-        st.session_state.expr = text  # so you can keep calculating
+        s.history.append(f"{expr} = {text}")
+        s.ans = value
+        s.expr = text      # so you can keep calculating
+        s.fresh = True     # next number starts a new calculation
     except ZeroDivisionError:
-        st.session_state.error = "Cannot divide by zero"
+        s.error = "Cannot divide by zero"
     except (ValueError, OverflowError):
-        st.session_state.error = "Math error. Check the input."
+        s.error = "Math error. Check the input."
     except SyntaxError:
-        st.session_state.error = "Invalid expression. Check brackets."
+        s.error = "Invalid expression."
     except Exception:
-        st.session_state.error = "Something went wrong."
+        s.error = "Something went wrong."
+
+
+def memory_action(token: str):
+    s = st.session_state
+    s.error = ""
+    if token == "MC":
+        s.memory = 0
+    elif token == "MR":
+        if s.fresh:
+            s.expr = ""
+        s.expr += fmt(s.memory)
+        s.fresh = False
+    else:  # M+ or M-
+        try:
+            value = safe_eval(prepare(close_brackets(s.expr.strip())), build_namespace(is_degrees()))
+            if isinstance(value, complex):
+                raise ValueError("complex")
+        except Exception:
+            s.error = "Enter a valid number first"
+            return
+        s.memory = s.memory + value if token == "M+" else s.memory - value
+        s.fresh = True
+
+
+# keys that continue from the previous result instead of starting over
+CONTINUE_TOKENS = {"+", "-", "*", "/", "^", "%", "!", "^2"}
 
 
 def press(token: str):
+    s = st.session_state
     if token == "CLEAR":
-        st.session_state.expr = ""
-        st.session_state.error = ""
+        s.expr, s.error, s.fresh = "", "", False
     elif token == "BACK":
-        st.session_state.expr = st.session_state.expr[:-1]
+        s.expr, s.error, s.fresh = s.expr[:-1], "", False
     elif token == "EQ":
         calculate()
+    elif token == "NEG":
+        e = s.expr
+        if e:
+            s.expr = e[2:-1] if (e.startswith("-(") and e.endswith(")")) else f"-({e})"
+    elif token in ("MC", "MR", "M+", "M-"):
+        memory_action(token)
     else:
-        st.session_state.expr += token
+        if s.fresh and token not in CONTINUE_TOKENS:
+            s.expr = ""   # a number or function after "=" starts a new calculation
+        s.fresh = False
+        s.error = ""
+        s.expr += token
 
 
 # ---------------------------------------------------------------
-# 5. LAYOUT
+# 5. KEYBOARD SUPPORT
 # ---------------------------------------------------------------
-# (label on key, text inserted / action, kind of key)
-ROWS = [
-    [("sin", "sin(", "fn"), ("cos", "cos(", "fn"), ("tan", "tan(", "fn"), ("(", "(", "fn"), (")", ")", "fn")],
-    [("sin⁻¹", "asin(", "fn"), ("cos⁻¹", "acos(", "fn"), ("tan⁻¹", "atan(", "fn"), ("xʸ", "^", "fn"), ("√", "sqrt(", "fn")],
-    [("log", "log(", "fn"), ("ln", "ln(", "fn"), ("π", "pi", "fn"), ("e", "e", "fn"), ("n!", "!", "fn")],
-    [("abs", "abs(", "fn"), ("mod", "%", "fn"), ("eˣ", "exp(", "fn"), ("10ˣ", "10^", "fn"), ("1/x", "1/(", "fn")],
-    [("7", "7", "num"), ("8", "8", "num"), ("9", "9", "num"), ("÷", "/", "op"), ("⌫", "BACK", "util")],
-    [("4", "4", "num"), ("5", "5", "num"), ("6", "6", "num"), ("×", "*", "op"), ("C", "CLEAR", "util")],
-    [("1", "1", "num"), ("2", "2", "num"), ("3", "3", "num"), ("−", "-", "op"), ("Ans", "ans", "fn")],
-    [("0", "0", "num"), (".", ".", "num"), ("x²", "^2", "fn"), ("+", "+", "op"), ("=", "EQ", "eq")],
-]
+# Streamlit cannot read the keyboard itself, so this small script listens for
+# key presses and clicks the matching on-screen button.
+KEYBOARD_JS = r"""
+(function () {
+  const KEYMAP = __KEYMAP__;
+  let win, doc;
+  try { win = window.parent; doc = win.document; } catch (err) { return; }
 
-with st.container(key="calc"):
-    # top bar: name on the left, angle mode on the right
-    with st.container(key="topbar"):
-        left, right = st.columns(2)
-        left.markdown('<div class="brand">Scientific</div>', unsafe_allow_html=True)
-        with right:
-            st.segmented_control(
-                "Angle mode", ["DEG", "RAD"], default="DEG",
-                key="angle", label_visibility="collapsed",
-            )
-
-    # screen
-    with st.container(key="screen"):
-        last = html.escape(st.session_state.history[-1]) if st.session_state.history else "&nbsp;"
-        st.markdown(f'<div class="prev">{last}</div>', unsafe_allow_html=True)
-        st.text_input(
-            "Expression", key="expr", on_change=calculate,
-            placeholder="0", label_visibility="collapsed",
-        )
-        err = html.escape(st.session_state.error) if st.session_state.error else "&nbsp;"
-        st.markdown(f'<div class="err">{err}</div>', unsafe_allow_html=True)
-
-    # keys
-    for r, row in enumerate(ROWS):
-        cols = st.columns(5)
-        for c, (label, token, kind) in enumerate(row):
-            cols[c].button(
-                label, key=f"{kind}_{r}_{c}", on_click=press, args=(token,), width="stretch",
-            )
-
-# history
-with st.expander("History"):
-    if st.session_state.history:
-        for item in reversed(st.session_state.history[-15:]):
-            st.markdown(f'<div class="hist">{html.escape(item)}</div>', unsafe_allow_html=True)
-        if st.button("Clear history", key="clear_history"):
-            st.session_state.history = []
-            st.rerun()
-    else:
-        st.markdown('<div class="hist-empty">Your calculations will show up here.</div>', unsafe_allow_html=True)
+  const SIMPLE = {
+    "0":"0","1":"1","2":"2","3":"3","4":"4","5":"5","6":"6","7":"7","8":"8","9":"9",
+    ".":".", "+":"+", "-":"-", "*":"*", "/":"/", "^":"^", "(":"(", ")":")",
+    "!":"!", "%":"%", "=":"EQ"
+  };
+  const SPECIAL = { Enter:"EQ", Backspace:"BACK", Delete:"CLEAR", Escape:"CLEAR" };
+  const LETTERS = {
+    s:"sin(", c:"cos(", t:"tan(", r:"sqrt(", l:"log(", n:"ln(", p:"pi", e:"e",
+    a:"ans", q:"^2", f:"!", b:"abs(", m:"%", x:"exp(",
